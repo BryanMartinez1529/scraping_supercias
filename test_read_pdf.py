@@ -51,6 +51,86 @@ logging.captureWarnings(True)
 logging.getLogger('urllib3').setLevel(logging.ERROR)
 
 
+def clean_for_search(text):
+    import unicodedata
+    if not text:
+        return ""
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII')
+    text = text.upper().strip()
+    text = re.sub(r'[^A-Z0-9\s&]', '', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def cargar_auditores_externos(ruta_excel):
+    registro = {}
+    if not os.path.exists(ruta_excel):
+        logging.warning(f"Archivo de auditores no encontrado en {ruta_excel}. Se omitirá el match por Excel.")
+        return registro
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(ruta_excel, read_only=True)
+        sheet = wb.active
+        
+        headers = [str(cell).strip().upper() for cell in next(sheet.iter_rows(max_row=1, values_only=True))]
+        
+        idx_rnae = headers.index('RNAE')
+        idx_nombre = headers.index('NOMBRE')
+        idx_ruc = headers.index('IDENTIFICACIÓN')
+        
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            if not row or len(row) <= max(idx_rnae, idx_nombre, idx_ruc):
+                continue
+            rnae = str(row[idx_rnae]).strip() if row[idx_rnae] is not None else ""
+            nombre = str(row[idx_nombre]).strip() if row[idx_nombre] is not None else ""
+            ruc = str(row[idx_ruc]).strip() if row[idx_ruc] is not None else ""
+            
+            if not rnae and not nombre:
+                continue
+                
+            nombre_limpio = nombre.replace("''", '"').replace("'", "").strip()
+            
+            search_terms = []
+            term_full = clean_for_search(nombre_limpio)
+            if term_full:
+                search_terms.append(term_full)
+                
+            matches_quotes = re.findall(r"['\"]+([^'\"]+)['\"]+", nombre)
+            for mq in matches_quotes:
+                term_q = clean_for_search(mq)
+                if len(term_q) >= 4:
+                    search_terms.append(term_q)
+                    
+            term_root = term_full
+            suffixes = [
+                r'\bCIA\b', r'\bLTDA\b', r'\bS\b', r'\bA\b', r'\bSAS\b',
+                r'\bLIMITADA\b', r'\bGROUP\b', r'\bAUDITORES\b', r'\bCONSULTORES\b',
+                r'\bASESORES\b', r'\bECUADOR\b', r'\bASSOCIATES\b', r'\bASOCIADOS\b',
+                r'\bCL\b', r'\bAAE\b'
+            ]
+            for suff in suffixes:
+                term_root = re.sub(suff, '', term_root).strip()
+            term_root = re.sub(r'\s+', ' ', term_root).strip()
+            if len(term_root) >= 5 and term_root not in search_terms:
+                search_terms.append(term_root)
+                
+            info = {
+                'rnae': rnae,
+                'nombre_original': nombre,
+                'nombre': nombre_limpio,
+                'ruc': ruc,
+                'search_terms': search_terms
+            }
+            
+            if rnae:
+                registro[rnae] = info
+                
+        logging.info(f"Cargados {len(registro)} auditores autorizados desde {ruta_excel}.")
+    except Exception as e:
+        logging.error(f"Error cargando base de auditores: {e}")
+    return registro
+
+
 # ==========================================
 # FUNCIONES AUXILIARES - ORIGINALES
 # ==========================================
@@ -156,7 +236,61 @@ def extract_company_data(driver, auto_complete_count):
 # FUNCIONES NUEVAS - AUDITORÍA EXTERNA PDF
 # ==========================================
 
-def process_captcha_modal(driver, max_intentos=5):
+def wait_for_loading(driver, timeout=90):
+    """
+    Espera a que los indicadores de 'Procesando' o 'statusDialog' desaparezcan de la pantalla.
+    """
+    start_time = time.time()
+    logging.info("Esperando que finalice el estado 'Procesando'...")
+    
+    # Damos 1.5 segundos para que aparezca el modal de carga si la red/servidor tarda en responder
+    time.sleep(1.5)
+    
+    while time.time() - start_time < timeout:
+        still_loading = False
+        try:
+            # 1. Diálogo con ID statusDialog
+            status_dialogs = driver.find_elements(By.ID, "statusDialog")
+            for dialog in status_dialogs:
+                if dialog.is_displayed():
+                    still_loading = True
+                    break
+            
+            # 2. Elementos con clase ui-blockui
+            if not still_loading:
+                blockers = driver.find_elements(By.CLASS_NAME, "ui-blockui")
+                for blocker in blockers:
+                    if blocker.is_displayed():
+                        still_loading = True
+                        break
+            
+            # 3. Cualquier diálogo visible con texto "procesando" o "cargando"
+            if not still_loading:
+                dialogs = driver.find_elements(By.CSS_SELECTOR, ".ui-dialog, .ui-dialog-content")
+                for d in dialogs:
+                    if d.is_displayed():
+                        # Evitamos el diálogo del captcha
+                        if d.get_attribute("id") == "dlgCaptcha":
+                            continue
+                        text = d.text.lower()
+                        if "procesando" in text or "cargando" in text or "procesando..." in text:
+                            still_loading = True
+                            break
+                            
+            if not still_loading:
+                break
+                
+        except Exception:
+            # Si hay un error (ej. StaleElementReferenceException), asumimos que sigue cargando
+            still_loading = True
+            
+        time.sleep(1)
+        
+    duration = round(time.time() - start_time, 2)
+    logging.info(f"Espera de procesamiento finalizada en {duration} segundos.")
+
+
+def process_captcha_modal(driver, max_intentos=10):
     """
     Resuelve el captcha del modal de Información Anual — hasta max_intentos.
     Retorna True si resolvió exitosamente o no se requería, False si falló tras los reintentos.
@@ -254,7 +388,7 @@ def process_captcha_modal(driver, max_intentos=5):
             )
             boton_verificar.click()
             logging.info("Captcha modal enviado")
-            time.sleep(4)
+            wait_for_loading(driver)
 
         except TimeoutException:
             if intento == 0:
@@ -282,12 +416,43 @@ def navigate_to_informacion_anual(driver):
         )
         menu_item.click()
         logging.info("Click en Información anual presentada")
-        time.sleep(3)
+        
+        # Esperamos a que finalice el estado "Procesando"
+        wait_for_loading(driver)
 
-        process_captcha_modal(driver)
+        # Esperamos a que aparezca el captcha modal o la tabla
+        logging.info("Esperando captcha modal o tabla de información anual...")
+        wait = WebDriverWait(driver, 45)
+        
+        class captcha_or_table_visible(object):
+            def __call__(self, d):
+                try:
+                    dlg = d.find_element(By.CSS_SELECTOR, "#dlgCaptcha")
+                    if dlg.is_displayed():
+                        return "captcha"
+                except Exception:
+                    pass
+                try:
+                    tbl = d.find_element(By.XPATH, "//*[@id='frmInformacionCompanias:tblInformacionAnual_data']")
+                    if tbl.is_displayed():
+                        return "table"
+                except Exception:
+                    pass
+                return False
 
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, "//*[@id='frmInformacionCompanias:tblInformacionAnual_data']"))
+        loaded_state = wait.until(captcha_or_table_visible())
+        logging.info(f"Estado detectado: {loaded_state}")
+
+        if loaded_state == "captcha":
+            captcha_resuelto = process_captcha_modal(driver)
+            if not captcha_resuelto:
+                logging.warning("No se pudo resolver el captcha modal de Información Anual")
+                return False
+            # Esperamos de nuevo tras enviar el captcha
+            wait_for_loading(driver)
+
+        WebDriverWait(driver, 30).until(
+            EC.visibility_of_element_located((By.XPATH, "//*[@id='frmInformacionCompanias:tblInformacionAnual_data']"))
         )
         logging.info("Tabla de información anual cargada")
         return True
@@ -483,7 +648,7 @@ def download_pdf_in_memory(driver, pdf_url):
         return None
 
 
-def extract_firma_auditora_from_pdf(pdf_bytes):
+def extract_firma_auditora_from_pdf(pdf_bytes, base_auditores=None):
     """
     Extrae firma auditora y socio firmante del PDF de Auditoria Externa.
 
@@ -496,6 +661,19 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
              "Etl-Ec Auditores S..A / Nancy Proaño (Reg. 680)"
              "Ing. Paola Zamora C (SC-RNAE-1562)"
     """
+    texto_completo_pdf = ""
+    # Intentamos extraer todo el texto digital usando PyMuPDF (muy rápido)
+    try:
+        import fitz
+        pdf_bytes.seek(0)
+        doc = fitz.open(stream=pdf_bytes.read(), filetype="pdf")
+        for num in range(min(8, doc.page_count)):
+            page_text = doc[num].get_text()
+            if page_text:
+                texto_completo_pdf += " " + page_text
+        doc.close()
+    except Exception as e:
+        logging.warning(f"Error al extraer texto preliminar con PyMuPDF: {e}")
 
     TITULOS_A_IGNORAR = [
         'dictamen de los auditores', 'informe de auditor', 'informe del auditor',
@@ -532,6 +710,17 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
     def limpiar_ocr(linea):
         linea = re.sub(r'^[|\[\]!l1I]+\s*', '', linea).strip()
         return re.sub(r'[|_]{2,}', '', linea).strip()
+
+    def es_cargo_o_ruido(nombre_l):
+        cargos = ['gerente', 'general', 'contador', 'contadora', 'presidente', 'administrador', 'representante', 'legal', 'secretario', 'director', 'comisario']
+        palabras = nombre_l.split()
+        if not palabras:
+            return True
+        if all(p in cargos for p in palabras):
+            return True
+        if len(nombre_l) < 4:
+            return True
+        return False
 
     def normalizar_nombre(nombre):
         nombre = re.sub(r'^[nN][gG]\.', 'Ing.', nombre)
@@ -618,13 +807,15 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
                     for j in range(max(0, i-4), i):
                         c = limpiar_ocr(lineas[j].strip())
                         c_norm = normalizar_nombre(c)
+                        c_l = c_norm.lower()
                         if (len(c_norm) > 6 and not es_titulo(c_norm)
                                 and not re.match(r'^[\d\s,\.°]+$', c_norm)
                                 and not es_ruido_ocr(c_norm)
-                                and 'cuenca' not in c_norm.lower()
-                                and 'ecuador' not in c_norm.lower()
-                                and 'samborondon' not in c_norm.lower()
-                                and 'registro' not in c_norm.lower()
+                                and not es_cargo_o_ruido(c_l)
+                                and 'cuenca' not in c_l
+                                and 'ecuador' not in c_l
+                                and 'samborondon' not in c_l
+                                and 'registro' not in c_l
                                 and len(c_norm.split()) >= 2):
                             resultado['persona'].append(c_norm)
                             resultado['socio'] = resultado['socio'] or c_norm
@@ -701,6 +892,7 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
                                 elif (2 <= len(c.split()) <= 4
                                       and not re.search(r'\d', c)
                                       and not es_titulo(c)
+                                      and not es_cargo_o_ruido(c.lower())
                                       and len(c) > 6
                                       and c[0].isupper()
                                       and not any(p in c.lower() for p in PATRONES_EMPRESA)):
@@ -747,6 +939,7 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
             for num in paginas_texto:
                 texto = pdf.pages[num].extract_text() or ""
                 if not texto.strip(): continue
+                texto_completo_pdf += " " + texto
                 lineas = [l.strip() for l in texto.split('\n') if l.strip()]
                 solo_inicio = num < 2
                 r = buscar_en_lineas(lineas, solo_primeras_lineas=solo_inicio)
@@ -787,6 +980,7 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
                        list(range(1, min(4, total_paginas))))
             for num in paginas:
                 texto = ocr_zona(doc_ocr, num, desde=0.60)
+                texto_completo_pdf += " " + texto
                 lineas = [l.strip() for l in texto.split('\n') if l.strip()]
                 r = buscar_en_lineas(lineas)
                 todas_empresas.extend([(e, num+1) for e in r['empresa']])
@@ -808,20 +1002,70 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
         evaluados = [(puntaje_candidato(n)[0], puntaje_candidato(n)[1], 0) for n, pg in todas_empresas]
         evaluados.sort(reverse=True)
         mejor_empresa = evaluados[0][1]
-        logging.info(f"Empresa auditora: '{mejor_empresa}'")
+        logging.info(f"Empresa auditora (candidata): '{mejor_empresa}'")
 
     if todos_personas:
         evaluados = [(puntaje_candidato(n)[0], puntaje_candidato(n)[1], 0) for n, _ in todos_personas]
         evaluados.sort(reverse=True)
         mejor_persona = evaluados[0][1]
-        logging.info(f"Persona auditora: '{mejor_persona}'")
+        logging.info(f"Persona auditora (candidata): '{mejor_persona}'")
 
     socio_final = None
     if todos_socios:
         socios_eval = [(puntaje_candidato(s)[0], puntaje_candidato(s)[1]) for s in todos_socios]
         socios_eval.sort(reverse=True)
         socio_final = socios_eval[0][1]
-        logging.info(f"Socio seleccionado: '{socio_final}'")
+        logging.info(f"Socio seleccionado (candidato): '{socio_final}'")
+
+    # ---- MATCH CON LA BASE DE DATOS DE EXCEL ----
+    matched_auditor = None
+    if base_auditores:
+        texto_pdf_limpio = clean_for_search(texto_completo_pdf)
+        
+        # 1. Intentar buscar por RNAE
+        rnae_matches = re.findall(r'(?:SC\s?RN\s?AE|RNAE|REGISTRO|REG|REGISTRO\s?NO|REG\s?NO)[-\s]*(\d+)', texto_pdf_limpio)
+        for r_num in rnae_matches:
+            r_num_clean = str(int(r_num)) if r_num.isdigit() else r_num
+            if r_num_clean in base_auditores:
+                matched_auditor = base_auditores[r_num_clean]
+                logging.info(f"Excel Match por RNAE '{r_num_clean}': {matched_auditor['nombre']}")
+                break
+                
+        # 2. Si no hay match por RNAE, buscar por nombre
+        if not matched_auditor:
+            matches_by_name = []
+            for r_num, info in base_auditores.items():
+                for term in info['search_terms']:
+                    if term in texto_pdf_limpio:
+                        matches_by_name.append((len(term), info))
+            if matches_by_name:
+                matches_by_name.sort(key=lambda x: x[0], reverse=True)
+                matched_auditor = matches_by_name[0][1]
+                logging.info(f"Excel Match por Nombre: {matched_auditor['nombre']} (RNAE: {matched_auditor['rnae']})")
+
+    # ---- Aplicar el match de la base de datos si existe ----
+    if matched_auditor:
+        es_empresa = any(w in matched_auditor['nombre'].upper() for w in ["CIA", "LTDA", "S.A", "SAS", "GROUP", "AUDITORES", "CONSULTORES", "ASESORES"])
+        mejor_rnae = matched_auditor['rnae']
+        if es_empresa:
+            mejor_empresa = matched_auditor['nombre']
+        else:
+            mejor_persona = matched_auditor['nombre']
+            mejor_empresa = None
+            socio_final = None # No hace falta socio para persona natural
+
+    # ---- Filtrar cargo o ruido del socio y persona ----
+    if socio_final and es_cargo_o_ruido(socio_final.lower()):
+        socio_final = None
+    if mejor_persona and es_cargo_o_ruido(mejor_persona.lower()):
+        mejor_persona = None
+
+    # ---- Filtrar socio si es igual al nombre de la empresa ----
+    if socio_final and matched_auditor:
+        clean_socio = clean_for_search(socio_final)
+        clean_company = clean_for_search(matched_auditor['nombre'])
+        if clean_socio in clean_company or clean_company in clean_socio:
+            socio_final = None
 
     if mejor_persona and socio_final:
         p_socio, _ = puntaje_candidato(socio_final)
@@ -830,6 +1074,12 @@ def extract_firma_auditora_from_pdf(pdf_bytes):
             socio_final = mejor_persona
     elif mejor_persona and not socio_final:
         socio_final = mejor_persona
+
+    # Normalizar formato de mejor_rnae
+    if mejor_rnae:
+        mejor_rnae_str = str(mejor_rnae)
+        if not mejor_rnae_str.startswith("SC-RNAE") and not mejor_rnae_str.startswith("Reg."):
+            mejor_rnae = f"SC-RNAE-{mejor_rnae_str}"
 
     # ---- Construir resultado final ----
     partes = []
@@ -875,7 +1125,7 @@ def close_pdf_modal(driver):
         pass
 
 
-def process_auditoria_externa(driver, expediente):
+def process_auditoria_externa(driver, expediente, base_auditores=None):
     resultado = {'firma': None, 'anio': None}
     try:
         if not navigate_to_informacion_anual(driver):
@@ -892,11 +1142,40 @@ def process_auditoria_externa(driver, expediente):
 
         logging.info(f"[{expediente}] Haciendo click en PDF de Auditoría Externa")
         pdf_link.click()
-        time.sleep(3)
+        
+        # Esperamos a que finalice el estado "Procesando"
+        wait_for_loading(driver)
 
-        captcha_resuelto = process_captcha_modal(driver)
-        if captcha_resuelto:
-            time.sleep(3)
+        # Esperamos a que aparezca el captcha modal o el modal del PDF
+        logging.info(f"[{expediente}] Esperando captcha modal o modal de PDF...")
+        wait = WebDriverWait(driver, 45)
+        
+        class captcha_or_pdf_visible(object):
+            def __call__(self, d):
+                try:
+                    dlg = d.find_element(By.CSS_SELECTOR, "#dlgCaptcha")
+                    if dlg.is_displayed():
+                        return "captcha"
+                except Exception:
+                    pass
+                try:
+                    if _is_visible(d, "//*[@id='dlgPresentarDocumentoPdf']") or \
+                       _is_visible(d, "//*[@id='dlgPresentarDocumentoPdfConFirmasElectronicas']"):
+                        return "pdf"
+                except Exception:
+                    pass
+                return False
+
+        loaded_state = wait.until(captcha_or_pdf_visible())
+        logging.info(f"[{expediente}] Estado detectado tras click en PDF: {loaded_state}")
+
+        if loaded_state == "captcha":
+            captcha_resuelto = process_captcha_modal(driver)
+            if not captcha_resuelto:
+                logging.warning(f"[{expediente}] No se pudo resolver el captcha del PDF")
+                return None
+            # Esperamos de nuevo tras resolver el captcha
+            wait_for_loading(driver)
 
         pdf_url = extract_pdf_url_from_modal(driver)
         if not pdf_url:
@@ -910,7 +1189,7 @@ def process_auditoria_externa(driver, expediente):
             close_pdf_modal(driver)
             return None
 
-        firma = extract_firma_auditora_from_pdf(pdf_bytes)
+        firma = extract_firma_auditora_from_pdf(pdf_bytes, base_auditores)
         resultado['firma'] = firma
         logging.info(f"[{expediente}] Resultado: firma={firma}, anio={resultado['anio']}")
 
@@ -1050,7 +1329,7 @@ def search_company(compania, driver, new_connection):
     return correos
 
 
-def process_database_records(error_file, processed_file, driver, new_connection):
+def process_database_records(error_file, processed_file, driver, new_connection, base_auditores=None):
     l_i = 1
     try:
         conn = psycopg2.connect(
@@ -1064,7 +1343,7 @@ def process_database_records(error_file, processed_file, driver, new_connection)
             FROM crm.adm_companias
             WHERE estado_proceso = 'T'
               AND fecha_actualizacion = '2026-05-26'
-              AND activos >= 642000 and activos <= 3000000 and provincia in ('PICHINCHA', 'PICHINCHA');
+              AND activos >= 642000 and activos <= 3000000 and provincia in ('PICHINCHA', 'GUAYAS', 'AZUAY', 'LOJA', 'COTOPAXI', 'CHIMBORAZO', 'GUAYAQUIL', 'MANABI', 'SANTA ELENA', 'IMBABURA', 'EL ORO', 'TUNGURAHUA');
         """)
         records = cursor.fetchall()
 
@@ -1091,7 +1370,7 @@ def process_database_records(error_file, processed_file, driver, new_connection)
                     try:
                         logging.info(f"[{expediente}] Navegando para extraccion de Auditoria Externa...")
                         _navegar_a_compania(driver, expediente)
-                        auditoria = process_auditoria_externa(driver, expediente)
+                        auditoria = process_auditoria_externa(driver, expediente, base_auditores)
 
                         firma_insertada = False
                         if auditoria and auditoria.get('firma'):
@@ -1245,8 +1524,12 @@ def main():
         # options.add_argument('--headless')
         driver = webdriver.Firefox(options=options)
 
+        # Cargar base de datos de auditores externos desde Excel
+        ruta_excel = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'auditores_externos.xlsx')
+        base_auditores = cargar_auditores_externos(ruta_excel)
+
         try:
-            process_database_records(ERROR_FILE, PROCESSED_FILE, driver, new_connection)
+            process_database_records(ERROR_FILE, PROCESSED_FILE, driver, new_connection, base_auditores)
         except KeyboardInterrupt:
             logging.info("Proceso interrumpido por el usuario.")
 

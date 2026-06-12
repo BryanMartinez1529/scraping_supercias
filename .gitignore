@@ -1,0 +1,12 @@
+/venv
+.env
+__pycache__
+*.pyc
+.csv
+scraping-supercias-by-exp-driver-chrome-db-processed.csv
+scraping-supercias-by-exp-driver-chrome-db-error.csv
+scraping-supercias-by-exp-driver-firefox.py
+scraping-supercias-by-exp-driver-firefox-db.py
+scraping-supercias-by-exp-driver-chrome-db.py
+test.py
+directorio_companias.xlsx
